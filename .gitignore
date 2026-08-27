@@ -1,0 +1,11 @@
+# 运行时产物(不入库)
+config.json
+error.log
+selftest.txt
+watch.txt
+chart-test.png
+*.new.exe
+
+# 系统
+Thumbs.db
+Desktop.ini
