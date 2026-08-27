@@ -97,7 +97,7 @@ version.json            # 在线更新版本清单(version / notes / sha256)
 
 [MIT](LICENSE)
 
-## ## 👊捐赠者
+## 👊捐赠者
 
 * Don Quijote
 *  页
