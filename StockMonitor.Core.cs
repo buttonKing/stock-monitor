@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.Drawing;
 using System.Drawing.Drawing2D;
 using System.Globalization;
@@ -838,6 +839,200 @@ namespace StockMonitor
                 }
             }
             catch { }
+        }
+    }
+
+    // ================================================================ 在线更新
+
+    /// <summary>在线更新:检查/下载/校验/替换重启,支持任意安装目录。</summary>
+    public static class Updater
+    {
+        /// <summary>当前版本号(发版时更新)。</summary>
+        public const string APP_VERSION = "14.0.0";
+
+        private const string Repo = "buttonKing/stock-monitor";
+        private const string ApiBase = "https://api.github.com/repos/" + Repo + "/contents/";
+        private const string RawAccept = "application/vnd.github.raw";
+
+        static Updater()
+        {
+            // 与行情模块一致:强制 TLS1.2(否则 api.github.com 握手失败)
+            ServicePointManager.SecurityProtocol =
+                (SecurityProtocolType)3072 | (SecurityProtocolType)768 | (SecurityProtocolType)192;
+            ServicePointManager.ServerCertificateValidationCallback = delegate { return true; };
+            try { ServicePointManager.DefaultConnectionLimit = 12; } catch { }
+        }
+
+        public class VersionInfo
+        {
+            public string Version = "";
+            public string Notes = "";
+            public string Sha256 = "";
+            public bool Ok;
+            public string Error = "";
+        }
+
+        /// <summary>从仓库读取 version.json(经 api.github.com,国内可访问)。</summary>
+        public static VersionInfo FetchVersion()
+        {
+            VersionInfo info = new VersionInfo();
+            try
+            {
+                string json = Encoding.UTF8.GetString(HttpGetRaw("version.json"));
+                Match mv = Regex.Match(json, "\"version\"\\s*:\\s*\"([^\"]*)\"");
+                Match mn = Regex.Match(json, "\"notes\"\\s*:\\s*\"((?:[^\"\\\\]|\\\\.)*)\"");
+                Match ms = Regex.Match(json, "\"sha256\"\\s*:\\s*\"([0-9a-fA-F]{64})\"");
+                if (!mv.Success || !ms.Success) { info.Error = "version.json 格式异常"; return info; }
+                info.Version = mv.Groups[1].Value;
+                info.Sha256 = ms.Groups[1].Value.ToLowerInvariant();
+                info.Notes = mn.Success ? mn.Groups[1].Value.Replace("\\n", "\n") : "";
+                info.Ok = true;
+            }
+            catch (Exception ex) { info.Error = ex.Message; }
+            return info;
+        }
+
+        /// <summary>下载仓库文件原始字节(contents API + raw Accept,返回文件本体)。</summary>
+        private static byte[] HttpGetRaw(string path)
+        {
+            string url = ApiBase + Uri.EscapeDataString(path);
+            HttpWebRequest req = (HttpWebRequest)WebRequest.Create(url);
+            req.Method = "GET";
+            req.UserAgent = "StockMonitor-Updater/1.0";
+            req.Accept = RawAccept;
+            req.Timeout = 20000;
+            req.ReadWriteTimeout = 20000;
+            req.KeepAlive = false;
+            using (HttpWebResponse res = (HttpWebResponse)req.GetResponse())
+            using (Stream st = res.GetResponseStream())
+            using (MemoryStream ms = new MemoryStream())
+            {
+                byte[] buf = new byte[8192];
+                int n;
+                while ((n = st.Read(buf, 0, buf.Length)) > 0) ms.Write(buf, 0, n);
+                return ms.ToArray();
+            }
+        }
+
+        public static byte[] DownloadExe(out string error)
+        {
+            error = "";
+            try { return HttpGetRaw("StockMonitor.exe"); }
+            catch (Exception ex) { error = ex.Message; return null; }
+        }
+
+        public static string Sha256Hex(byte[] data)
+        {
+            using (System.Security.Cryptography.SHA256 sha = System.Security.Cryptography.SHA256.Create())
+            {
+                byte[] h = sha.ComputeHash(data);
+                StringBuilder sb = new StringBuilder();
+                foreach (byte b in h) sb.Append(b.ToString("x2"));
+                return sb.ToString();
+            }
+        }
+
+        /// <summary>版本比较:latest 比 current 新返回 true。</summary>
+        public static bool IsNewer(string latest, string current)
+        {
+            int[] a = ParseVer(latest), b = ParseVer(current);
+            for (int i = 0; i < 3; i++)
+            {
+                if (a[i] > b[i]) return true;
+                if (a[i] < b[i]) return false;
+            }
+            return false;
+        }
+
+        private static int[] ParseVer(string v)
+        {
+            int[] r = { 0, 0, 0 };
+            if (v == null) return r;
+            string[] parts = v.Split('.');
+            for (int i = 0; i < parts.Length && i < 3; i++)
+            {
+                int n;
+                int.TryParse(parts[i], out n);
+                r[i] = n;
+            }
+            return r;
+        }
+
+        /// <summary>目录是否可写(创建临时文件测试)。</summary>
+        public static bool IsDirWritable(string dir)
+        {
+            try
+            {
+                string probe = System.IO.Path.Combine(dir, ".smw_" + Guid.NewGuid().ToString("N"));
+                File.WriteAllText(probe, "t");
+                File.Delete(probe);
+                return true;
+            }
+            catch { return false; }
+        }
+
+        /// <summary>
+        /// 保证在可写位置运行:当前目录不可写时,重定向到 %LOCALAPPDATA%\StockMonitor\。
+        /// 首次自动拷贝自身与 config.json 过去,然后以新路径重启并退出本进程。
+        /// </summary>
+        public static void EnsureRunnableLocation()
+        {
+            try
+            {
+                string exe = Application.ExecutablePath;
+                string dir = System.IO.Path.GetDirectoryName(exe);
+                if (IsDirWritable(dir)) return; // 可写,原地运行(便携模式)
+
+                string localDir = System.IO.Path.Combine(
+                    Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "StockMonitor");
+                string localExe = System.IO.Path.Combine(localDir, "StockMonitor.exe");
+                if (string.Equals(System.IO.Path.GetFullPath(localExe), System.IO.Path.GetFullPath(exe),
+                                  StringComparison.OrdinalIgnoreCase)) return;
+
+                Directory.CreateDirectory(localDir);
+                if (!File.Exists(localExe)) File.Copy(exe, localExe, false);
+                // 迁移配置
+                string cfg = System.IO.Path.Combine(dir, "config.json");
+                string cfg2 = System.IO.Path.Combine(localDir, "config.json");
+                if (File.Exists(cfg) && !File.Exists(cfg2))
+                {
+                    try { File.Copy(cfg, cfg2, false); } catch { }
+                }
+                Process.Start(localExe);
+                Environment.Exit(0);
+            }
+            catch { /* 重定向失败则继续原地运行 */ }
+        }
+
+        /// <summary>
+        /// 安装更新:将新 exe 写入同目录 .new,生成 update.bat(等待本进程退出→覆盖→重启→自删),返回 bat 路径。
+        /// </summary>
+        public static string InstallUpdate(byte[] newExe, out string error)
+        {
+            error = "";
+            try
+            {
+                string dir = System.IO.Path.GetDirectoryName(Application.ExecutablePath);
+                string newPath = System.IO.Path.Combine(dir, "StockMonitor.exe.new");
+                File.WriteAllBytes(newPath, newExe);
+                string batPath = System.IO.Path.Combine(dir, "update.bat");
+                string bat =
+                    "@echo off\r\n" +
+                    "echo [start] %date% %time% >> \"%~dp0updater.log\"\r\n" +
+                    ":wait\r\n" +
+                    "tasklist /FI \"IMAGENAME eq StockMonitor.exe\" 2>nul | find /i \"StockMonitor.exe\" >nul\r\n" +
+                    "if %errorlevel% equ 0 ( timeout /t 1 /nobreak >nul & goto wait )\r\n" +
+                    "echo [replace] %date% %time% >> \"%~dp0updater.log\"\r\n" +
+                    "copy /y \"%~dp0StockMonitor.exe.new\" \"%~dp0StockMonitor.exe\" >> \"%~dp0updater.log\"\r\n" +
+                    "del \"%~dp0StockMonitor.exe.new\"\r\n" +
+                    "echo [launch] %date% %time% >> \"%~dp0updater.log\"\r\n" +
+                    "start \"\" \"%~dp0StockMonitor.exe\"\r\n" +
+                    "echo [done] %date% %time% >> \"%~dp0updater.log\"\r\n" +
+                    "del \"%~f0\"\r\n";
+                File.WriteAllText(batPath, bat, Encoding.ASCII);
+                return batPath;
+            }
+            catch (Exception ex) { error = ex.Message; return null; }
         }
     }
 }
