@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.Drawing;
 using System.Drawing.Drawing2D;
 using System.Globalization;
@@ -105,6 +106,15 @@ namespace StockMonitor
             restoreTimer = new System.Windows.Forms.Timer { Interval = 240 };
             restoreTimer.Tick += delegate { restoreTimer.Stop(); Restore(); };
             KickRefresh();
+        }
+
+        protected override void OnShown(EventArgs e)
+        {
+            base.OnShown(e);
+            // 启动后延迟2秒自动检查更新
+            System.Windows.Forms.Timer t = new System.Windows.Forms.Timer { Interval = 2000 };
+            t.Tick += delegate { t.Stop(); t.Dispose(); UpdateFlow.CheckAndPrompt(this, true); };
+            t.Start();
         }
 
         protected override CreateParams CreateParams
@@ -1424,8 +1434,10 @@ namespace StockMonitor
             btnAddRule.Click += delegate { grid.Rows.Add("", "KDJ_J", ">=", "80", true); };
             Button btnTest = new Button { Text = "测试红光提醒", Location = new Point(104, 8), Size = new Size(110, 26) };
             btnTest.Click += delegate { new AlertForm(Math.Max(1, (int)numSec.Value), false).Show(); };
+            Button btnUpdate = new Button { Text = "检查更新", Location = new Point(220, 8), Size = new Size(96, 26) };
+            btnUpdate.Click += delegate { UpdateFlow.CheckAndPrompt(this, false); };
             Panel top = new Panel { Dock = DockStyle.Top, Height = 42 };
-            top.Controls.Add(btnAddRule); top.Controls.Add(btnTest);
+            top.Controls.Add(btnAddRule); top.Controls.Add(btnTest); top.Controls.Add(btnUpdate);
             tpAlert.Controls.Add(grid); tpAlert.Controls.Add(top);
             grid.BringToFront();
 
@@ -1538,6 +1550,79 @@ namespace StockMonitor
             if (cond.StartsWith("CROSS_UP")) return "CROSS_UP";
             if (cond.StartsWith("CROSS_DOWN")) return "CROSS_DOWN";
             return cond.Trim();
+        }
+    }
+
+    // ================================================================ 更新流程
+
+    public static class UpdateFlow
+    {
+        /// <summary>检查更新并提示。auto=false 时(手动)也提示"已是最新/失败"。</summary>
+        public static void CheckAndPrompt(Form owner, bool auto)
+        {
+            ThreadPool.QueueUserWorkItem(delegate
+            {
+                try
+                {
+                    Updater.VersionInfo info = Updater.FetchVersion();
+                    bool newer = info.Ok && Updater.IsNewer(info.Version, Updater.APP_VERSION);
+                    SafeInvoke(owner, delegate
+                    {
+                        if (!info.Ok)
+                        {
+                            if (!auto) MessageBox.Show(owner, "检查更新失败:" + info.Error, "更新", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                            return;
+                        }
+                        if (!newer)
+                        {
+                            if (!auto) MessageBox.Show(owner, "已是最新版本 v" + Updater.APP_VERSION, "更新", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                            return;
+                        }
+                        string notes = info.Notes.Length > 0 ? info.Notes : "(无更新说明)";
+                        DialogResult r = MessageBox.Show(owner,
+                            "发现新版本 v" + info.Version + "\r\n\r\n更新内容:\r\n" + notes + "\r\n\r\n是否立即更新?",
+                            "发现新版本", MessageBoxButtons.YesNo, MessageBoxIcon.Question);
+                        if (r == DialogResult.Yes) DoUpdate(owner, info);
+                    });
+                }
+                catch (Exception ex) { Log.Error("CheckAndPrompt", ex); }
+            });
+        }
+
+        /// <summary>下载→sha256校验→安装→退出重启。</summary>
+        public static void DoUpdate(Form owner, Updater.VersionInfo info)
+        {
+            ThreadPool.QueueUserWorkItem(delegate
+            {
+                try
+                {
+                    SafeInvoke(owner, delegate { if (owner != null) owner.Text = "正在更新..."; });
+                    string err;
+                    byte[] exe = Updater.DownloadExe(out err);
+                    if (exe == null) { SafeInvoke(owner, delegate { MessageBox.Show(owner, "下载失败:" + err, "更新", MessageBoxButtons.OK, MessageBoxIcon.Warning); }); return; }
+                    string sha = Updater.Sha256Hex(exe);
+                    if (!string.Equals(sha, info.Sha256, StringComparison.OrdinalIgnoreCase))
+                    {
+                        SafeInvoke(owner, delegate { MessageBox.Show(owner, "更新文件校验失败(sha256 不一致),已取消。", "更新", MessageBoxButtons.OK, MessageBoxIcon.Warning); });
+                        return;
+                    }
+                    string bat = Updater.InstallUpdate(exe, out err);
+                    if (bat == null) { SafeInvoke(owner, delegate { MessageBox.Show(owner, "写入更新失败:" + err, "更新", MessageBoxButtons.OK, MessageBoxIcon.Warning); }); return; }
+                    Process.Start(new ProcessStartInfo("cmd.exe", "/c \"" + bat + "\"") { WindowStyle = ProcessWindowStyle.Hidden });
+                    SafeInvoke(owner, delegate { owner.Close(); });
+                }
+                catch (Exception ex) { Log.Error("DoUpdate", ex); }
+            });
+        }
+
+        private static void SafeInvoke(Form owner, Action a)
+        {
+            try
+            {
+                if (owner != null && owner.IsHandleCreated) owner.BeginInvoke(a);
+                else a();
+            }
+            catch { }
         }
     }
 
@@ -1654,6 +1739,27 @@ namespace StockMonitor
         private static int Main(string[] args)
         {
             if (args.Length > 0 && args[0] == "--selftest") return SelfTest();
+            if (args.Length > 0 && args[0] == "--autoupdate")
+            {
+                // 无界面自动更新(供测试/静默更新):下载→校验→安装→交给 bat 重启
+                try
+                {
+                    Updater.VersionInfo info = Updater.FetchVersion();
+                    if (!info.Ok) { Log.Error("autoupdate: fetch", new Exception(info.Error)); return 1; }
+                    string err;
+                    byte[] exe = Updater.DownloadExe(out err);
+                    if (exe == null) { Log.Error("autoupdate: download", new Exception(err)); return 1; }
+                    string sha = Updater.Sha256Hex(exe);
+                    if (!string.Equals(sha, info.Sha256, StringComparison.OrdinalIgnoreCase))
+                    { Log.Error("autoupdate: sha", new Exception("mismatch " + sha + " vs " + info.Sha256)); return 1; }
+                    string bat = Updater.InstallUpdate(exe, out err);
+                    if (bat == null) { Log.Error("autoupdate: install", new Exception(err)); return 1; }
+                    Process.Start(new ProcessStartInfo("cmd.exe", "/c \"" + bat + "\"") { WindowStyle = ProcessWindowStyle.Hidden });
+                    return 0;
+                }
+                catch (Exception ex) { Log.Error("autoupdate", ex); return 1; }
+            }
+            Updater.EnsureRunnableLocation();
 
             Application.EnableVisualStyles();
             Application.SetCompatibleTextRenderingDefault(false);
