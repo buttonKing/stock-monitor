@@ -68,3 +68,25 @@ build.bat              # 一键编译(系统自带 csc)
 - 支持任意安装目录:exe 所在目录不可写时(如 Program Files),自动重定向到用户目录运行
 - 更新文件经 sha256 校验,防止下载损坏
 - 也可在「配置 → 提醒方式 → 检查更新」手动检查
+## 🛠️ 维护者:如何发布新版本
+
+更新机制:程序启动时读取仓库 ersion.json,比对版本号,发现新版则下载 exe 并自动替换重启。
+
+**发布步骤:**
+
+1. **改版本号**:编辑 StockMonitor.Core.cs,修改 Updater.APP_VERSION(如 "14.1.0")
+2. **编译**:运行 uild.bat,生成新的 StockMonitor.exe
+3. **计算哈希**:
+   `powershell
+   Get-FileHash StockMonitor.exe -Algorithm SHA256
+   `
+4. **更新 version.json**:修改 ersion(与上一步一致)、
+otes(本次更新说明,用户会看到)、sha256(上一步的哈希)
+5. **上传两个文件到仓库**:
+   - StockMonitor.exe
+   - ersion.json
+   (建议同时创建 GitHub Release 并附加 exe;网络受限时可调用 pi.github.com 的 contents API 上传)
+6. **完成**:用户下次启动(或点"配置 → 检查更新")即收到更新提示,一键升级。
+
+> ⚠️ 注意:sha256 必须与上传的 exe 完全一致,否则客户端会拒绝更新(安全校验)。
+> 若同时修改了源码中的其他行为,记得同步更新 README.md 与「使用说明.txt」。
